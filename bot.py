@@ -1,9 +1,12 @@
 """Small, single-worker Telegram chatbot. Run: python bot.py"""
+import base64
+import binascii
 import logging
 import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from io import BytesIO
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitError
@@ -26,6 +29,9 @@ class Settings:
     max_input: int
     cooldown: int
     system_prompt: str
+    image_model: str = "gpt-image-1.5"
+    image_quality: str = "low"
+    image_cooldown: int = 60
 
     @classmethod
     def from_env(cls):
@@ -53,6 +59,9 @@ class Settings:
         allow_all = os.getenv("ALLOW_ALL_USERS", "false").strip().lower()
         if allow_all not in ("true", "false"):
             raise ValueError("ALLOW_ALL_USERS must be true or false")
+        image_quality = os.getenv("IMAGE_QUALITY", "low").strip().lower()
+        if image_quality not in ("low", "medium", "high"):
+            raise ValueError("IMAGE_QUALITY must be low, medium, or high")
         return cls(
             required("TELEGRAM_BOT_TOKEN"), required("OPENAI_API_KEY"),
             os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini",
@@ -62,6 +71,9 @@ class Settings:
             integer("MAX_INPUT_CHARS", 3000, 1, 10000),
             integer("COOLDOWN_SECONDS", 3, 0, 3600),
             os.getenv("SYSTEM_PROMPT", "أنت مساعد ودود. أجب بالعربية ما لم يطلب المستخدم لغة أخرى. اجعل إجاباتك واضحة ومختصرة."),
+            os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5").strip() or "gpt-image-1.5",
+            image_quality,
+            integer("IMAGE_COOLDOWN_SECONDS", 60, 0, 3600),
         )
 
 
@@ -93,13 +105,14 @@ class ChatBot:
         if user_id not in self.sessions:
             if len(self.sessions) >= 1000:
                 self.sessions.popitem(last=False)
-            self.sessions[user_id] = {"history": [], "last_request": float("-inf")}
+            self.sessions[user_id] = {"history": [], "last_request": float("-inf"), "last_image": float("-inf")}
         self.sessions.move_to_end(user_id)
         return self.sessions[user_id]
 
     async def start(self, update, context):
         await update.message.reply_text(
             "أهلًا! أرسل رسالة نصية لنتحدث.\n"
+            "/image وصف الصورة — إنشاء صورة بالذكاء الاصطناعي\n"
             "/reset — بدء محادثة جديدة\n/id — معرفة رقم حسابك\n"
             "نص رسائلك والسياق الحديث يُرسلان إلى OpenAI للإجابة. "
             "الذاكرة مؤقتة وتُمسح عند إعادة تشغيل البوت."
@@ -164,13 +177,77 @@ class ChatBot:
             log.warning("OpenAI API status=%s", exc.status_code)
             await message.reply_text("تعذّر إكمال الطلب. على صاحب البوت مراجعة مفتاح OpenAI واسم النموذج وصلاحياته في الإعدادات.")
 
+    async def image(self, update, context):
+        user_id = update.effective_user.id
+        message = update.message
+        cfg = self.settings
+        if not self.allowed(user_id):
+            await message.reply_text("حسابك غير مفعّل لهذا البوت. استخدم /id وأضف الرقم إلى ALLOWED_USER_IDS في إعدادات البوت.")
+            return
+        parts = message.text.split(maxsplit=1)
+        prompt = parts[1].strip() if len(parts) == 2 else ""
+        if not prompt:
+            await message.reply_text("اكتب وصف الصورة بعد الأمر، مثل:\n/image مدينة مستقبلية وقت الغروب")
+            return
+        if len(prompt) > cfg.max_input:
+            await message.reply_text(f"أرسل وصفًا لا يتجاوز {cfg.max_input} حرف.")
+            return
+        state = self.session(user_id)
+        now = time.monotonic()
+        if now - state["last_request"] < cfg.cooldown or now - state["last_image"] < cfg.image_cooldown:
+            await message.reply_text("انتظر قليلًا قبل طلب صورة أخرى.")
+            return
+        await message.reply_text("جارٍ إنشاء الصورة، قد يستغرق ذلك بضع دقائق...")
+        state["last_request"] = state["last_image"] = now
+        try:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+        except TelegramError:
+            pass
+        try:
+            # Images need a longer timeout; disable retries to avoid duplicate paid requests.
+            response = await self.client.images.generate(
+                model=cfg.image_model, prompt=prompt, n=1,
+                size="1024x1024", quality=cfg.image_quality,
+                output_format="jpeg", timeout=300.0,
+            )
+            encoded = response.data[0].b64_json if response.data else None
+            if not encoded:
+                await message.reply_text("لم تصل صورة من الخدمة. جرّب وصفًا آخر.")
+                return
+            try:
+                image_bytes = base64.b64decode(encoded, validate=True)
+                if not image_bytes:
+                    raise ValueError("Empty image")
+            except (binascii.Error, ValueError):
+                log.warning("Invalid image payload")
+                await message.reply_text("وصلت صورة غير صالحة من الخدمة. حاول لاحقًا.")
+                return
+            with BytesIO(image_bytes) as photo:
+                await message.reply_photo(photo=photo, filename="generated-image.jpg", write_timeout=60, read_timeout=60)
+        except RateLimitError:
+            log.warning("OpenAI image RateLimitError")
+            await message.reply_text("تعذّر إنشاء الصورة: راجع رصيد API وحدود الطلبات في OpenAI.")
+        except APIConnectionError:
+            log.warning("OpenAI image connection/timeout error")
+            await message.reply_text("تعذّر الاتصال بخدمة الصور أو انتهت مهلة الانتظار. حاول لاحقًا.")
+        except APIStatusError as exc:
+            log.warning("OpenAI image API status=%s", exc.status_code)
+            if exc.code in ("moderation_blocked", "content_policy_violation"):
+                await message.reply_text("تعذّر إنشاء الصورة بهذا الوصف. جرّب وصفًا مختلفًا.")
+            else:
+                await message.reply_text("تعذّر إنشاء الصورة. راجع صلاحية توليد الصور وموديل OPENAI_IMAGE_MODEL في إعدادات OpenAI.")
+        except TelegramError:
+            log.warning("Telegram image delivery failed")
+            await message.reply_text("تم إنشاء الصورة لكن تعذّر إرسالها إلى تيليغرام. قد يكون الطلب احتُسب؛ لم نكرر التوليد تلقائيًا.")
+
     async def unsupported(self, update, context):
-        await update.message.reply_text("هذه النسخة تدعم النصوص فقط. أرسل سؤالًا مكتوبًا، أو استخدم /help.")
+        await update.message.reply_text("أرسل سؤالًا نصيًا أو استخدم /image مع وصف لإنشاء صورة. تعديل الصور المرفقة والصوت غير مدعومين.")
 
     async def post_init(self, application):
         await application.bot.set_my_commands([
             BotCommand("start", "بدء المحادثة"), BotCommand("help", "طريقة الاستخدام"),
             BotCommand("reset", "مسح سياق المحادثة"), BotCommand("id", "رقم حسابك"),
+            BotCommand("image", "إنشاء صورة من وصف"),
         ])
         log.info("Bot initialized; starting polling")
 
@@ -195,7 +272,7 @@ def build_application(settings):
            .concurrent_updates(False).post_init(bot.post_init)
            .post_shutdown(bot.shutdown).build())
     private = filters.ChatType.PRIVATE
-    for name, handler in (("start", bot.start), ("help", bot.start), ("id", bot.identify), ("reset", bot.reset)):
+    for name, handler in (("start", bot.start), ("help", bot.start), ("id", bot.identify), ("reset", bot.reset), ("image", bot.image)):
         app.add_handler(CommandHandler(name, handler, filters=private))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, bot.text))
     app.add_handler(MessageHandler(private, bot.unsupported))
