@@ -45,6 +45,7 @@
 | `OPENAI_API_KEY` | مفتاح مشروع OpenAI | مطلوب |
 | `OPENAI_MODEL` | `gpt-4.1-mini` | النموذج الافتراضي |
 | `OPENAI_IMAGE_MODEL` | `gpt-image-2.5-sunburst` | نموذج إنشاء الصور الأقوى للجودة |
+| `OPENAI_IMAGE_FALLBACK_MODEL` | `gpt-image-2.5-flare` | محرك احتياطي إذا لم تتوفر صلاحية المحرك الأقوى |
 | `OPENAI_IMAGE_QUALITY` | `high` | جودة الصور: `auto` أو `low` أو `medium` أو `high` أو `xhigh` أو `max` |
 | `ALLOWED_USER_IDS` | اتركه فارغًا مؤقتًا | بعد التشغيل أضف رقمك من `/id` |
 | `ALLOW_ALL_USERS` | `false` | حصر المحادثة بالمستخدمين المحددين |

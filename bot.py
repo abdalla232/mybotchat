@@ -41,6 +41,7 @@ class Settings:
     openai_key: str
     model: str
     image_model: str
+    image_fallback_model: str
     image_quality: str
     transcription_model: str
     allowed_ids: frozenset[int]
@@ -101,6 +102,9 @@ class Settings:
             image_model=os.getenv(
                 "OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst"
             ).strip() or "gpt-image-2.5-sunburst",
+            image_fallback_model=os.getenv(
+                "OPENAI_IMAGE_FALLBACK_MODEL", "gpt-image-2.5-flare"
+            ).strip() or "gpt-image-2.5-flare",
             image_quality=image_quality,
             transcription_model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-transcribe").strip(),
             allowed_ids=ids,
@@ -401,14 +405,31 @@ class ChatBot:
             return
         await self.send_menu_text(update.message, "🎨 عم جهّز الصورة، قد يستغرق ذلك قليلًا…")
         try:
-            result = await self.client.images.generate(
-                model=self.settings.image_model,
-                prompt=prompt,
-                size="1024x1024",
-                quality=self.settings.image_quality,
-                output_format="png",
-                n=1,
-            )
+            try:
+                result = await self.generate_image_request(
+                    self.settings.image_model,
+                    prompt,
+                )
+            except APIStatusError as exc:
+                fallback = self.settings.image_fallback_model
+                if (
+                    getattr(exc, "status_code", None) in (403, 404)
+                    and fallback
+                    and fallback != self.settings.image_model
+                ):
+                    log.warning(
+                        "Image model %s unavailable (status=%s); retrying with %s",
+                        self.settings.image_model,
+                        exc.status_code,
+                        fallback,
+                    )
+                    await self.send_menu_text(
+                        update.message,
+                        "⚠️ المحرك الأقوى غير متاح لحسابك، سأجرّب المحرك الاحتياطي.",
+                    )
+                    result = await self.generate_image_request(fallback, prompt)
+                else:
+                    raise
             image_bytes = base64.b64decode(result.data[0].b64_json)
             image = BytesIO(image_bytes)
             image.name = "generated.png"
@@ -420,6 +441,16 @@ class ChatBot:
             self.session(update.effective_user.id)["mode"] = "chat"
         except (RateLimitError, APIConnectionError, APIStatusError) as exc:
             await self.api_error(update.message, exc)
+
+    async def generate_image_request(self, model, prompt):
+        return await self.client.images.generate(
+            model=model,
+            prompt=prompt,
+            size="1024x1024",
+            quality=self.settings.image_quality,
+            output_format="png",
+            n=1,
+        )
 
     async def photo(self, update, context):
         if not await self.begin_expensive_request(update):
@@ -557,8 +588,25 @@ class ChatBot:
         elif isinstance(exc, APIConnectionError):
             text = "تعذّر الاتصال بـOpenAI. حاول لاحقًا."
         else:
-            log.warning("OpenAI API status=%s", getattr(exc, "status_code", "unknown"))
-            text = "تعذّر الطلب. راجع اسم النموذج وصلاحيات مفتاح OpenAI."
+            status = getattr(exc, "status_code", None)
+            request_id = getattr(exc, "request_id", None)
+            log.warning("OpenAI API status=%s request_id=%s", status or "unknown", request_id)
+            if status == 401:
+                text = "تعذّر الطلب: مفتاح OpenAI غير صالح. راجع OPENAI_API_KEY."
+            elif status == 403:
+                text = (
+                    "تعذّر الطلب: حساب OpenAI لا يملك صلاحية هذه الميزة. "
+                    "أكمل Organization Verification من منصة OpenAI."
+                )
+            elif status == 404:
+                text = (
+                    "تعذّر الطلب: النموذج غير متاح لمشروع OpenAI الحالي. "
+                    "راجع اسم النموذج أو استخدم المحرك الاحتياطي."
+                )
+            elif status == 400:
+                text = "تعذّر الطلب: أحد إعدادات النموذج غير مدعوم. راجع متغيرات Railway."
+            else:
+                text = "تعذّر طلب OpenAI مؤقتًا. راجع Deploy Logs في Railway."
         await self.send_menu_text(message, text)
 
     async def post_init(self, application):

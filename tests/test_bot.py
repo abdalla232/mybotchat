@@ -1,8 +1,11 @@
 import os
 import unittest
+import base64
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
+from openai import APIStatusError
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.error import TimedOut
 
@@ -24,6 +27,7 @@ def settings(**overrides):
         openai_key="test-only",
         model="gpt-6-luna",
         image_model="gpt-image-2.5-sunburst",
+        image_fallback_model="gpt-image-2.5-flare",
         image_quality="high",
         transcription_model="gpt-transcribe",
         allowed_ids=frozenset({7}),
@@ -126,6 +130,27 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.session(7)["mode"], "image")
         markup = update.message.reply_text.call_args.kwargs["reply_markup"]
         self.assertIsInstance(markup, ReplyKeyboardRemove)
+
+    async def test_image_model_falls_back_when_primary_is_unavailable(self):
+        unavailable = APIStatusError(
+            "model unavailable",
+            response=httpx.Response(
+                404,
+                request=httpx.Request("POST", "https://api.openai.com/v1/images/generations"),
+            ),
+            body={"error": {"code": "model_not_found"}},
+        )
+        generated = SimpleNamespace(
+            data=[SimpleNamespace(b64_json=base64.b64encode(b"png").decode("ascii"))]
+        )
+        self.client.images.generate.side_effect = [unavailable, generated]
+        update = message_update()
+
+        await self.bot.generate_image(update, "a blue bird")
+
+        models = [call.kwargs["model"] for call in self.client.images.generate.await_args_list]
+        self.assertEqual(models, ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare"])
+        update.message.reply_photo.assert_awaited_once()
 
     async def test_youtube_button_sets_mode(self):
         update = message_update(MENU_YOUTUBE)
