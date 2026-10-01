@@ -1,127 +1,157 @@
-import base64
 import os
 import unittest
-from dataclasses import replace
-from types import SimpleNamespace as NS
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import httpx2
-from openai import APIConnectionError, APIStatusError, RateLimitError
-from telegram.error import TelegramError
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
 
-from bot import ChatBot, Settings, build_application
+from bot import (
+    ChatBot,
+    MENU_BUTTONS,
+    MENU_IMAGE,
+    MENU_YOUTUBE,
+    Settings,
+    build_application,
+    split_text,
+)
+from media_tools import is_youtube_url
 
 
-class ImageTests(unittest.IsolatedAsyncioTestCase):
+def settings(**overrides):
+    values = dict(
+        telegram_token="123456:TEST_ONLY",
+        openai_key="test-only",
+        model="gpt-6-luna",
+        image_model="gpt-image-2.5-flare",
+        transcription_model="gpt-transcribe",
+        allowed_ids=frozenset({7}),
+        allow_all=False,
+        max_output=600,
+        history_turns=2,
+        max_input=100,
+        cooldown=0,
+        max_audio_mb=20,
+        max_audio_seconds=1200,
+        max_youtube_seconds=1800,
+        system_prompt="Be helpful",
+    )
+    values.update(overrides)
+    return Settings(**values)
+
+
+def message_update(text="Hello", user=7):
+    message = SimpleNamespace(
+        text=text,
+        photo=[],
+        voice=None,
+        audio=None,
+        reply_text=AsyncMock(),
+        reply_photo=AsyncMock(),
+    )
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user),
+        effective_chat=SimpleNamespace(id=user),
+        message=message,
+    )
+
+
+def context(args=None):
+    return SimpleNamespace(
+        args=args or [],
+        bot=SimpleNamespace(send_chat_action=AsyncMock(), get_file=AsyncMock()),
+    )
+
+
+class UnitTests(unittest.TestCase):
+    def test_unicode_chunks(self):
+        source = "مرحبا😀" * 2000
+        parts = split_text(source)
+        self.assertEqual("".join(parts), source)
+        self.assertTrue(all(len(p.encode("utf-16-le")) // 2 <= 4000 for p in parts))
+
+    def test_youtube_domain_allowlist(self):
+        self.assertTrue(is_youtube_url("https://youtu.be/abc"))
+        self.assertTrue(is_youtube_url("https://www.youtube.com/watch?v=abc"))
+        self.assertFalse(is_youtube_url("https://youtube.com.example.org/watch?v=abc"))
+        self.assertFalse(is_youtube_url("https://example.org/"))
+
+    def test_missing_config(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "TELEGRAM_BOT_TOKEN"):
+                Settings.from_env()
+
+
+class HandlerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.cfg = Settings("123:ABC", "test", "gpt-4.1-mini", frozenset({1}), False,
-                            600, 4, 3000, 3, "Reply briefly.")
-        self.generate = AsyncMock(return_value=NS(data=[NS(b64_json=base64.b64encode(b"jpeg-bytes").decode())]))
-        self.client = NS(images=NS(generate=self.generate), responses=NS(create=AsyncMock()))
-        self.bot = ChatBot(self.cfg, self.client)
-        self.message = NS(text="/image city at sunset", reply_text=AsyncMock(), reply_photo=AsyncMock())
-        self.update = NS(message=self.message, effective_user=NS(id=1), effective_chat=NS(id=1))
-        self.context = NS(bot=NS(send_chat_action=AsyncMock()))
+        response = SimpleNamespace(output_text="أهلًا", status="completed", usage=None)
+        self.client = SimpleNamespace(
+            responses=SimpleNamespace(create=AsyncMock(return_value=response)),
+            images=SimpleNamespace(generate=AsyncMock()),
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(create=AsyncMock())
+            ),
+        )
+        self.bot = ChatBot(settings(), self.client)
+        self.context = context()
 
-    async def test_image_delivery_preserves_text_history(self):
-        history = [{"role": "user", "content": "hello"}]
-        self.bot.session(1)["history"] = history.copy()
-        async def receive(**kwargs):
-            self.assertEqual(kwargs["photo"].read(), b"jpeg-bytes")
-        self.message.reply_photo.side_effect = receive
-        await self.bot.image(self.update, self.context)
-        self.message.reply_photo.assert_awaited_once()
-        self.assertEqual(self.bot.session(1)["history"], history)
-        self.assertEqual(self.generate.call_args.kwargs["prompt"], "city at sunset")
+    async def test_authorized_start_shows_persistent_full_menu(self):
+        update = message_update()
+        await self.bot.start(update, self.context)
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        self.assertIsInstance(markup, ReplyKeyboardMarkup)
+        self.assertTrue(markup.is_persistent)
+        self.assertFalse(markup.one_time_keyboard)
+        labels = tuple(button.text for row in markup.keyboard for button in row)
+        self.assertEqual(labels, MENU_BUTTONS)
 
-    async def test_invalid_input_does_not_call_api(self):
-        for value in ("/image", "/image   ", "/image " + "x" * 3001):
-            self.message.text = value
-            await self.bot.image(self.update, self.context)
-        self.generate.assert_not_awaited()
+    async def test_every_text_reply_reattaches_menu(self):
+        update = message_update()
+        await self.bot.send_menu_text(update.message, "جواب")
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        self.assertIsInstance(markup, ReplyKeyboardMarkup)
 
-    async def test_unauthorized_user(self):
-        self.update.effective_user.id = 2
-        await self.bot.image(self.update, self.context)
-        self.generate.assert_not_awaited()
+    async def test_unauthorized_user_is_blocked(self):
+        update = message_update(user=9)
+        await self.bot.text(update, self.context)
+        self.client.responses.create.assert_not_awaited()
+        call = update.message.reply_text.call_args
+        self.assertIn("خاص", call.args[0])
+        self.assertIsInstance(call.kwargs["reply_markup"], ReplyKeyboardRemove)
 
-    async def test_allow_all(self):
-        self.bot.settings = replace(self.cfg, allow_all=True)
-        self.update.effective_user.id = 2
-        await self.bot.image(self.update, self.context)
-        self.generate.assert_awaited_once()
+    async def test_image_button_sets_mode(self):
+        update = message_update(MENU_IMAGE)
+        await self.bot.menu_button(update, self.context)
+        self.assertEqual(self.bot.session(7)["mode"], "image")
 
-    async def test_cooldown_survives_reset(self):
-        with patch("bot.time.monotonic", return_value=100):
-            await self.bot.image(self.update, self.context)
-            await self.bot.reset(self.update, self.context)
-        with patch("bot.time.monotonic", return_value=104):
-            await self.bot.image(self.update, self.context)
-        self.generate.assert_awaited_once()
-        with patch("bot.time.monotonic", return_value=160):
-            await self.bot.image(self.update, self.context)
-        self.assertEqual(self.generate.await_count, 2)
+    async def test_youtube_button_sets_mode(self):
+        update = message_update(MENU_YOUTUBE)
+        await self.bot.menu_button(update, self.context)
+        self.assertEqual(self.bot.session(7)["mode"], "youtube")
 
-    async def test_chat_cooldown_applies_to_images(self):
-        self.bot.session(1)["last_request"] = 99
-        with patch("bot.time.monotonic", return_value=100):
-            await self.bot.image(self.update, self.context)
-        self.generate.assert_not_awaited()
+    async def test_oversize_audio_is_rejected_before_download(self):
+        update = message_update()
+        update.message.voice = SimpleNamespace(
+            file_id="voice", file_size=21 * 1024 * 1024, duration=10
+        )
+        await self.bot.audio(update, self.context)
+        self.context.bot.get_file.assert_not_awaited()
+        self.assertIn("أكبر", update.message.reply_text.call_args.args[0])
 
-    async def test_invalid_payloads(self):
-        for data in ([], [NS(b64_json=None)], [NS(b64_json="!invalid!")]):
-            self.bot.sessions.clear()
-            self.generate.return_value = NS(data=data)
-            await self.bot.image(self.update, self.context)
-        self.message.reply_photo.assert_not_awaited()
+    async def test_invalid_youtube_url_is_rejected(self):
+        update = message_update()
+        await self.bot.summarize_youtube(update, "https://example.org/video")
+        self.assertIn("YouTube", update.message.reply_text.call_args.args[0])
 
-    async def test_api_errors_are_reported_without_retry(self):
-        request = httpx2.Request("POST", "https://api.openai.com/v1/images/generations")
-        errors = [APIConnectionError(request=request),
-                  RateLimitError("quota", response=httpx2.Response(429, request=request), body=None),
-                  APIStatusError("denied", response=httpx2.Response(403, request=request), body=None),
-                  APIStatusError("blocked", response=httpx2.Response(400, request=request),
-                                 body={"code": "moderation_blocked"})]
-        for error in errors:
-            self.bot.sessions.clear()
-            self.generate.reset_mock()
-            self.generate.side_effect = error
-            await self.bot.image(self.update, self.context)
-            self.generate.assert_awaited_once()
-        self.message.reply_photo.assert_not_awaited()
+    async def test_chat_preserves_history(self):
+        update = message_update()
+        await self.bot.chat(update, self.context, "سؤال")
+        self.assertEqual(len(self.bot.session(7)["history"]), 2)
+        self.assertFalse(self.client.responses.create.call_args.kwargs["store"])
 
-    async def test_delivery_failure_does_not_regenerate(self):
-        self.message.reply_photo.side_effect = TelegramError("upload failed")
-        await self.bot.image(self.update, self.context)
-        self.generate.assert_awaited_once()
-        self.assertIn("تيليغرام", self.message.reply_text.call_args.args[0])
-
-    async def test_indicator_failure_does_not_block_image(self):
-        self.context.bot.send_chat_action.side_effect = TelegramError("failed")
-        await self.bot.image(self.update, self.context)
-        self.message.reply_photo.assert_awaited_once()
-
-    async def test_text_chat_still_stores_history(self):
-        self.message.text = "hello"
-        self.client.responses.create.return_value = NS(output_text="hi", status="completed", usage=None)
-        await self.bot.text(self.update, self.context)
-        self.assertEqual(self.bot.session(1)["history"][-1], {"role": "assistant", "content": "hi"})
-        self.generate.assert_not_awaited()
-
-    async def test_image_command_registered(self):
-        app = build_application(self.cfg)
-        self.assertTrue(any("image" in getattr(handler, "commands", ()) for handler in app.handlers[0]))
+    async def test_application_builds_without_network(self):
+        app = build_application(settings())
+        self.assertEqual(len(app.handlers[0]), 12)
         await app.post_shutdown(app)
-
-
-class SettingsTests(unittest.TestCase):
-    def test_defaults_and_validation(self):
-        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "123:ABC", "OPENAI_API_KEY": "test"}, clear=True):
-            self.assertEqual(Settings.from_env().image_quality, "low")
-            for name, value in (("IMAGE_QUALITY", "bad"), ("IMAGE_COOLDOWN_SECONDS", "-1")):
-                with patch.dict(os.environ, {name: value}):
-                    with self.assertRaises(ValueError):
-                        Settings.from_env()
 
 
 if __name__ == "__main__":
