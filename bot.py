@@ -153,18 +153,53 @@ class ChatBot:
                 [MENU_ID, MENU_HELP],
             ],
             resize_keyboard=True,
-            is_persistent=True,
-            one_time_keyboard=False,
+            is_persistent=False,
+            one_time_keyboard=True,
         )
 
-    async def send_menu_text(self, message, text):
+    async def send_menu_text(self, message, text, reply_markup=None):
         parts = split_text(text)
         for index, part in enumerate(parts):
             await message.reply_text(
                 part,
                 parse_mode=None,
-                reply_markup=self.menu_keyboard() if index == len(parts) - 1 else None,
+                reply_markup=reply_markup if index == len(parts) - 1 else None,
             )
+
+    async def download_telegram_bytes(self, bot, file_id):
+        """Download a Telegram file with longer timeouts and transient retries."""
+        last_error = None
+        for attempt in range(3):
+            try:
+                telegram_file = await bot.get_file(
+                    file_id,
+                    read_timeout=30,
+                    write_timeout=30,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+                output = BytesIO()
+                await telegram_file.download_to_memory(
+                    out=output,
+                    read_timeout=60,
+                    write_timeout=60,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+                data = output.getvalue()
+                if not data:
+                    raise TelegramError("Downloaded Telegram file is empty")
+                return data
+            except TelegramError as exc:
+                last_error = exc
+                log.warning(
+                    "Telegram media download attempt %s failed: %s",
+                    attempt + 1,
+                    type(exc).__name__,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        raise last_error
 
     async def deny(self, update):
         user_id = update.effective_user.id
@@ -198,7 +233,18 @@ class ChatBot:
         await self.send_menu_text(
             update.message,
             "👋 أهلًا بك في بوت الذكاء الاصطناعي\n\n"
-            "اختر ميزة من القائمة أو أرسل سؤالك مباشرة.",
+            "اختر ميزة من القائمة أو أرسل سؤالك مباشرة.\n"
+            "لإظهار القائمة لاحقًا استخدم /menu.",
+            reply_markup=self.menu_keyboard(),
+        )
+
+    async def menu_command(self, update, context):
+        if not await self.require_access(update):
+            return
+        await self.send_menu_text(
+            update.message,
+            "اختر الميزة التي تريدها:",
+            reply_markup=self.menu_keyboard(),
         )
 
     async def help_command(self, update, context):
@@ -212,13 +258,17 @@ class ChatBot:
             "• استخراج النص ووصف محتوى الصور.\n"
             "• تحويل الرسائل والملفات الصوتية إلى نص.\n"
             "• تلخيص فيديو YouTube عام ضمن حد المدة.\n\n"
+            "استخدم /menu لإظهار لوحة الأزرار من جديد.\n"
             "يمكنك أيضًا استخدام /image و/youtube و/chat و/reset و/id.",
+            reply_markup=ReplyKeyboardRemove(),
         )
 
     async def identify(self, update, context):
         if self.allowed(update.effective_user.id):
             await self.send_menu_text(
-                update.message, f"🆔 رقم حسابك: {update.effective_user.id}"
+                update.message,
+                f"🆔 رقم حسابك: {update.effective_user.id}",
+                reply_markup=ReplyKeyboardRemove(),
             )
         else:
             await self.deny(update)
@@ -229,13 +279,21 @@ class ChatBot:
         state = self.session(update.effective_user.id)
         state["history"] = []
         state["mode"] = "chat"
-        await self.send_menu_text(update.message, "✅ تم مسح المحادثة وبدء محادثة جديدة.")
+        await self.send_menu_text(
+            update.message,
+            "✅ تم مسح المحادثة وبدء محادثة جديدة.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
     async def set_mode(self, update, mode, prompt):
         if not await self.require_access(update):
             return
         self.session(update.effective_user.id)["mode"] = mode
-        await self.send_menu_text(update.message, prompt)
+        await self.send_menu_text(
+            update.message,
+            prompt,
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
     async def chat_command(self, update, context):
         await self.set_mode(update, "chat", "💬 وضع المحادثة مفعّل. أرسل سؤالك.")
@@ -347,7 +405,7 @@ class ChatBot:
             await update.message.reply_photo(
                 photo=image,
                 caption="✅ تم إنشاء الصورة.",
-                reply_markup=self.menu_keyboard(),
+                reply_markup=ReplyKeyboardRemove(),
             )
             self.session(update.effective_user.id)["mode"] = "chat"
         except (RateLimitError, APIConnectionError, APIStatusError) as exc:
@@ -358,8 +416,10 @@ class ChatBot:
             return
         await self.send_menu_text(update.message, "🖼 عم حلّل الصورة وأستخرج النص…")
         try:
-            telegram_file = await context.bot.get_file(update.message.photo[-1].file_id)
-            data = bytes(await telegram_file.download_as_bytearray())
+            data = await self.download_telegram_bytes(
+                context.bot,
+                update.message.photo[-1].file_id,
+            )
             encoded = base64.b64encode(data).decode("ascii")
             instruction = (
                 "استخرج كل النص الظاهر في الصورة بدقة مع الحفاظ على ترتيب الأسطر قدر الإمكان. "
@@ -495,6 +555,7 @@ class ChatBot:
         await application.bot.set_my_commands(
             [
                 BotCommand("start", "فتح القائمة"),
+                BotCommand("menu", "إظهار لوحة الأزرار"),
                 BotCommand("chat", "وضع المحادثة"),
                 BotCommand("image", "إنشاء صورة"),
                 BotCommand("youtube", "تلخيص فيديو YouTube"),
@@ -527,7 +588,8 @@ def build_application(settings):
     )
     private = filters.ChatType.PRIVATE
     commands = (
-        ("start", bot.start), ("chat", bot.chat_command),
+        ("start", bot.start), ("menu", bot.menu_command),
+        ("chat", bot.chat_command),
         ("image", bot.image_command), ("youtube", bot.youtube_command),
         ("reset", bot.reset), ("id", bot.identify), ("help", bot.help_command),
     )

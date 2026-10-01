@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.error import TimedOut
 
 from bot import (
     ChatBot,
@@ -94,21 +95,21 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.bot = ChatBot(settings(), self.client)
         self.context = context()
 
-    async def test_authorized_start_shows_persistent_full_menu(self):
+    async def test_authorized_start_shows_one_time_menu(self):
         update = message_update()
         await self.bot.start(update, self.context)
         markup = update.message.reply_text.call_args.kwargs["reply_markup"]
         self.assertIsInstance(markup, ReplyKeyboardMarkup)
-        self.assertTrue(markup.is_persistent)
-        self.assertFalse(markup.one_time_keyboard)
+        self.assertFalse(markup.is_persistent)
+        self.assertTrue(markup.one_time_keyboard)
         labels = tuple(button.text for row in markup.keyboard for button in row)
         self.assertEqual(labels, MENU_BUTTONS)
 
-    async def test_every_text_reply_reattaches_menu(self):
+    async def test_normal_text_reply_does_not_reattach_menu(self):
         update = message_update()
         await self.bot.send_menu_text(update.message, "جواب")
         markup = update.message.reply_text.call_args.kwargs["reply_markup"]
-        self.assertIsInstance(markup, ReplyKeyboardMarkup)
+        self.assertIsNone(markup)
 
     async def test_unauthorized_user_is_blocked(self):
         update = message_update(user=9)
@@ -122,6 +123,8 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         update = message_update(MENU_IMAGE)
         await self.bot.menu_button(update, self.context)
         self.assertEqual(self.bot.session(7)["mode"], "image")
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        self.assertIsInstance(markup, ReplyKeyboardRemove)
 
     async def test_youtube_button_sets_mode(self):
         update = message_update(MENU_YOUTUBE)
@@ -142,6 +145,23 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.summarize_youtube(update, "https://example.org/video")
         self.assertIn("YouTube", update.message.reply_text.call_args.args[0])
 
+    async def test_telegram_photo_download_retries_after_timeout(self):
+        telegram_file = SimpleNamespace(download_to_memory=AsyncMock())
+        self.context.bot.get_file.side_effect = [TimedOut(), telegram_file]
+        expected = b"test-image"
+
+        async def write_image(out, **kwargs):
+            out.write(expected)
+
+        telegram_file.download_to_memory.side_effect = write_image
+        with patch("bot.asyncio.sleep", new=AsyncMock()):
+            result = await self.bot.download_telegram_bytes(
+                self.context.bot,
+                "photo-id",
+            )
+        self.assertEqual(result, expected)
+        self.assertEqual(self.context.bot.get_file.await_count, 2)
+
     async def test_chat_preserves_history(self):
         update = message_update()
         await self.bot.chat(update, self.context, "سؤال")
@@ -150,7 +170,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_application_builds_without_network(self):
         app = build_application(settings())
-        self.assertEqual(len(app.handlers[0]), 12)
+        self.assertEqual(len(app.handlers[0]), 13)
         await app.post_shutdown(app)
 
 
