@@ -41,6 +41,7 @@ class Settings:
     openai_key: str
     model: str
     image_model: str
+    image_quality: str
     transcription_model: str
     allowed_ids: frozenset[int]
     allow_all: bool
@@ -87,11 +88,20 @@ class Settings:
         if allow_all not in ("true", "false"):
             raise ValueError("ALLOW_ALL_USERS must be true or false")
 
+        image_quality = os.getenv("OPENAI_IMAGE_QUALITY", "high").strip().lower() or "high"
+        if image_quality not in ("auto", "low", "medium", "high", "xhigh", "max"):
+            raise ValueError(
+                "OPENAI_IMAGE_QUALITY must be auto, low, medium, high, xhigh, or max"
+            )
+
         return cls(
             telegram_token=required("TELEGRAM_BOT_TOKEN"),
             openai_key=required("OPENAI_API_KEY"),
             model=os.getenv("OPENAI_MODEL", "gpt-6-luna").strip() or "gpt-6-luna",
-            image_model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare").strip(),
+            image_model=os.getenv(
+                "OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst"
+            ).strip() or "gpt-image-2.5-sunburst",
+            image_quality=image_quality,
             transcription_model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-transcribe").strip(),
             allowed_ids=ids,
             allow_all=allow_all == "true",
@@ -395,7 +405,7 @@ class ChatBot:
                 model=self.settings.image_model,
                 prompt=prompt,
                 size="1024x1024",
-                quality="low",
+                quality=self.settings.image_quality,
                 output_format="png",
                 n=1,
             )
