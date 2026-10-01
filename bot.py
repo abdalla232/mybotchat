@@ -14,7 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitError
 from telegram import BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from media_tools import convert_to_mp3, download_youtube_audio, is_youtube_url
@@ -152,7 +152,10 @@ class ChatBot:
             if len(self.sessions) >= 1000:
                 self.sessions.popitem(last=False)
             self.sessions[user_id] = {
-                "history": [], "mode": "chat", "last_request": float("-inf")
+                "history": [],
+                "mode": "chat",
+                "last_request": float("-inf"),
+                "pending_image_file_id": None,
             }
         self.sessions.move_to_end(user_id)
         return self.sessions[user_id]
@@ -293,6 +296,7 @@ class ChatBot:
         state = self.session(update.effective_user.id)
         state["history"] = []
         state["mode"] = "chat"
+        state["pending_image_file_id"] = None
         await self.send_menu_text(
             update.message,
             "✅ تم مسح المحادثة وبدء محادثة جديدة.",
@@ -302,7 +306,9 @@ class ChatBot:
     async def set_mode(self, update, mode, prompt):
         if not await self.require_access(update):
             return
-        self.session(update.effective_user.id)["mode"] = mode
+        state = self.session(update.effective_user.id)
+        state["mode"] = mode
+        state["pending_image_file_id"] = None
         await self.send_menu_text(
             update.message,
             prompt,
@@ -318,7 +324,11 @@ class ChatBot:
                 return
             await self.generate_image(update, " ".join(context.args))
         else:
-            await self.set_mode(update, "image", "🎨 أرسل وصف الصورة التي تريد إنشاءها.")
+            await self.set_mode(
+                update,
+                "image",
+                "🎨 أرسل وصفًا لإنشاء صورة جديدة، أو أرسل صورة مع التعديل المطلوب في التعليق.",
+            )
 
     async def youtube_command(self, update, context):
         if context.args:
@@ -333,7 +343,11 @@ class ChatBot:
         if choice == MENU_CHAT:
             await self.chat_command(update, context)
         elif choice == MENU_IMAGE:
-            await self.set_mode(update, "image", "🎨 أرسل وصف الصورة التي تريد إنشاءها.")
+            await self.set_mode(
+                update,
+                "image",
+                "🎨 أرسل وصفًا لإنشاء صورة جديدة، أو أرسل صورة مع التعديل المطلوب في التعليق.",
+            )
         elif choice == MENU_OCR:
             await self.set_mode(update, "ocr", "🖼 أرسل الصورة الآن، وسأستخرج النص وأصف محتواها.")
         elif choice == MENU_AUDIO:
@@ -361,6 +375,13 @@ class ChatBot:
         mode = self.session(update.effective_user.id)["mode"]
         if mode == "image":
             await self.generate_image(update, text)
+        elif mode == "image_edit":
+            file_id = self.session(update.effective_user.id).get("pending_image_file_id")
+            if file_id:
+                await self.edit_image(update, context, file_id, text)
+            else:
+                self.session(update.effective_user.id)["mode"] = "image"
+                await self.send_menu_text(update.message, "أرسل الصورة التي تريد تعديلها أولًا.")
         elif mode == "youtube":
             await self.summarize_youtube(update, text)
         elif mode == "ocr":
@@ -437,8 +458,14 @@ class ChatBot:
                 photo=image,
                 caption="✅ تم إنشاء الصورة.",
                 reply_markup=ReplyKeyboardRemove(),
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=30,
+                pool_timeout=30,
             )
-            self.session(update.effective_user.id)["mode"] = "chat"
+            state = self.session(update.effective_user.id)
+            state["mode"] = "chat"
+            state["pending_image_file_id"] = None
         except (RateLimitError, APIConnectionError, APIStatusError) as exc:
             await self.api_error(update.message, exc)
 
@@ -452,7 +479,85 @@ class ChatBot:
             n=1,
         )
 
+    async def edit_image(self, update, context, file_id, prompt):
+        if not await self.begin_expensive_request(update):
+            return
+        await self.send_menu_text(update.message, "🎨 عم عدّل الصورة، قد يستغرق ذلك قليلًا…")
+        try:
+            source_bytes = await self.download_telegram_bytes(context.bot, file_id)
+            try:
+                result = await self.edit_image_request(
+                    self.settings.image_model,
+                    source_bytes,
+                    prompt,
+                )
+            except APIStatusError as exc:
+                fallback = self.settings.image_fallback_model
+                if (
+                    getattr(exc, "status_code", None) in (403, 404)
+                    and fallback
+                    and fallback != self.settings.image_model
+                ):
+                    log.warning(
+                        "Image edit model %s unavailable (status=%s); retrying with %s",
+                        self.settings.image_model,
+                        exc.status_code,
+                        fallback,
+                    )
+                    result = await self.edit_image_request(fallback, source_bytes, prompt)
+                else:
+                    raise
+
+            edited_bytes = base64.b64decode(result.data[0].b64_json)
+            edited = BytesIO(edited_bytes)
+            edited.name = "edited.png"
+            await update.message.reply_photo(
+                photo=edited,
+                caption="✅ تم تعديل الصورة.",
+                reply_markup=ReplyKeyboardRemove(),
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+            state = self.session(update.effective_user.id)
+            state["mode"] = "chat"
+            state["pending_image_file_id"] = None
+        except (RateLimitError, APIConnectionError, APIStatusError) as exc:
+            await self.api_error(update.message, exc)
+        except TelegramError:
+            await self.send_menu_text(update.message, "تعذّر تنزيل الصورة من Telegram.")
+
+    async def edit_image_request(self, model, image_bytes, prompt):
+        source = BytesIO(image_bytes)
+        source.name = "source.jpg"
+        return await self.client.images.edit(
+            model=model,
+            image=source,
+            prompt=prompt,
+            size="1024x1024",
+            quality=self.settings.image_quality,
+            output_format="png",
+            n=1,
+        )
+
     async def photo(self, update, context):
+        if not await self.require_access(update):
+            return
+        state = self.session(update.effective_user.id)
+        if state["mode"] in ("image", "image_edit"):
+            file_id = update.message.photo[-1].file_id
+            prompt = (update.message.caption or "").strip()
+            if prompt:
+                await self.edit_image(update, context, file_id, prompt)
+            else:
+                state["mode"] = "image_edit"
+                state["pending_image_file_id"] = file_id
+                await self.send_menu_text(
+                    update.message,
+                    "✅ وصلت الصورة. اكتب الآن التعديل المطلوب، مثل: غيّر الخلفية إلى شاطئ.",
+                )
+            return
         if not await self.begin_expensive_request(update):
             return
         await self.send_menu_text(update.message, "🖼 عم حلّل الصورة وأستخرج النص…")
@@ -629,6 +734,10 @@ class ChatBot:
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Handler error: %s", type(context.error).__name__)
+    if isinstance(context.error, NetworkError):
+        # Telegram may accept a media upload even when the client times out
+        # before receiving the confirmation. Avoid reporting a false failure.
+        return
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text("حدث خطأ مؤقت. حاول لاحقًا.")

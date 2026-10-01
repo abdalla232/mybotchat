@@ -48,6 +48,7 @@ def settings(**overrides):
 def message_update(text="Hello", user=7):
     message = SimpleNamespace(
         text=text,
+        caption=None,
         photo=[],
         voice=None,
         audio=None,
@@ -92,7 +93,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         response = SimpleNamespace(output_text="أهلًا", status="completed", usage=None)
         self.client = SimpleNamespace(
             responses=SimpleNamespace(create=AsyncMock(return_value=response)),
-            images=SimpleNamespace(generate=AsyncMock()),
+            images=SimpleNamespace(generate=AsyncMock(), edit=AsyncMock()),
             audio=SimpleNamespace(
                 transcriptions=SimpleNamespace(create=AsyncMock())
             ),
@@ -151,6 +152,47 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         models = [call.kwargs["model"] for call in self.client.images.generate.await_args_list]
         self.assertEqual(models, ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare"])
         update.message.reply_photo.assert_awaited_once()
+        upload = update.message.reply_photo.call_args.kwargs
+        self.assertEqual(upload["read_timeout"], 120)
+        self.assertEqual(upload["write_timeout"], 120)
+
+    async def test_image_mode_stores_photo_until_edit_prompt_arrives(self):
+        update = message_update()
+        update.message.photo = [SimpleNamespace(file_id="source-photo")]
+        self.bot.session(7)["mode"] = "image"
+
+        await self.bot.photo(update, self.context)
+
+        state = self.bot.session(7)
+        self.assertEqual(state["mode"], "image_edit")
+        self.assertEqual(state["pending_image_file_id"], "source-photo")
+        self.client.images.edit.assert_not_awaited()
+
+    async def test_photo_can_be_edited_from_followup_text(self):
+        telegram_file = SimpleNamespace(download_to_memory=AsyncMock())
+
+        async def write_image(out, **kwargs):
+            out.write(b"source-image")
+
+        telegram_file.download_to_memory.side_effect = write_image
+        self.context.bot.get_file.return_value = telegram_file
+        self.client.images.edit.return_value = SimpleNamespace(
+            data=[SimpleNamespace(b64_json=base64.b64encode(b"edited").decode("ascii"))]
+        )
+        update = message_update("add snow")
+        state = self.bot.session(7)
+        state["mode"] = "image_edit"
+        state["pending_image_file_id"] = "source-photo"
+
+        await self.bot.text(update, self.context)
+
+        self.client.images.edit.assert_awaited_once()
+        edit_request = self.client.images.edit.call_args.kwargs
+        self.assertEqual(edit_request["model"], "gpt-image-2.5-sunburst")
+        self.assertEqual(edit_request["prompt"], "add snow")
+        update.message.reply_photo.assert_awaited_once()
+        self.assertEqual(state["mode"], "chat")
+        self.assertIsNone(state["pending_image_file_id"])
 
     async def test_youtube_button_sets_mode(self):
         update = message_update(MENU_YOUTUBE)
