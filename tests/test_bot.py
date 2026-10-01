@@ -31,6 +31,7 @@ def settings(**overrides):
         image_quality="high",
         transcription_model="gpt-transcribe",
         allowed_ids=frozenset({7}),
+        image_allowed_ids=frozenset({7}),
         allow_all=False,
         max_output=600,
         history_turns=2,
@@ -131,6 +132,26 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.session(7)["mode"], "image")
         markup = update.message.reply_text.call_args.kwargs["reply_markup"]
         self.assertIsInstance(markup, ReplyKeyboardRemove)
+
+    async def test_allowed_friend_cannot_use_or_see_image_feature(self):
+        restricted = ChatBot(
+            settings(
+                allowed_ids=frozenset({7, 8}),
+                image_allowed_ids=frozenset({7}),
+            ),
+            self.client,
+        )
+        update = message_update(user=8)
+
+        await restricted.start(update, self.context)
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        labels = tuple(button.text for row in markup.keyboard for button in row)
+        self.assertNotIn(MENU_IMAGE, labels)
+
+        update.message.reply_text.reset_mock()
+        await restricted.image_command(update, context(["a cat"]))
+        self.client.images.generate.assert_not_awaited()
+        self.assertIn("صاحب البوت", update.message.reply_text.call_args.args[0])
 
     async def test_image_model_falls_back_when_primary_is_unavailable(self):
         unavailable = APIStatusError(

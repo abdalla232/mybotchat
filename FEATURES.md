@@ -20,6 +20,7 @@ OPENAI_IMAGE_MODEL=gpt-image-2.5-sunburst
 OPENAI_IMAGE_FALLBACK_MODEL=gpt-image-2.5-flare
 OPENAI_IMAGE_QUALITY=high
 OPENAI_TRANSCRIPTION_MODEL=gpt-transcribe
+IMAGE_ALLOWED_USER_IDS=123456789
 MAX_OUTPUT_TOKENS=1800
 MAX_AUDIO_MB=20
 MAX_AUDIO_SECONDS=1200
@@ -35,3 +36,4 @@ MAX_YOUTUBE_SECONDS=1800
 - تلخيص YouTube يستهلك تكلفة تنزيل/تفريغ الصوت ثم تكلفة التلخيص.
 - أرسل الصور كـPhoto داخل Telegram. الملفات المرسلة كـDocument ليست ضمن هذه النسخة.
 - أبقِ `ALLOW_ALL_USERS=false` وأضف أرقام المستخدمين إلى `ALLOWED_USER_IDS` لحماية رصيدك.
+- ضع رقمك وحدك في `IMAGE_ALLOWED_USER_IDS` حتى لا يتمكن باقي المستخدمين من إنشاء الصور أو تعديلها.

@@ -45,6 +45,7 @@ class Settings:
     image_quality: str
     transcription_model: str
     allowed_ids: frozenset[int]
+    image_allowed_ids: frozenset[int]
     allow_all: bool
     max_output: int
     history_turns: int
@@ -85,6 +86,19 @@ class Settings:
                 "ALLOWED_USER_IDS must contain positive numeric IDs separated by commas"
             ) from None
 
+        try:
+            image_ids = frozenset(
+                int(value.strip())
+                for value in os.getenv("IMAGE_ALLOWED_USER_IDS", "").split(",")
+                if value.strip()
+            )
+            if any(value <= 0 for value in image_ids):
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                "IMAGE_ALLOWED_USER_IDS must contain positive numeric IDs separated by commas"
+            ) from None
+
         allow_all = os.getenv("ALLOW_ALL_USERS", "false").strip().lower()
         if allow_all not in ("true", "false"):
             raise ValueError("ALLOW_ALL_USERS must be true or false")
@@ -108,6 +122,7 @@ class Settings:
             image_quality=image_quality,
             transcription_model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-transcribe").strip(),
             allowed_ids=ids,
+            image_allowed_ids=image_ids,
             allow_all=allow_all == "true",
             max_output=integer("MAX_OUTPUT_TOKENS", 1800, 16, 4096),
             history_turns=integer("HISTORY_TURNS", 4, 0, 20),
@@ -147,6 +162,9 @@ class ChatBot:
     def allowed(self, user_id):
         return self.settings.allow_all or user_id in self.settings.allowed_ids
 
+    def image_allowed(self, user_id):
+        return user_id in self.settings.image_allowed_ids
+
     def session(self, user_id):
         if user_id not in self.sessions:
             if len(self.sessions) >= 1000:
@@ -161,14 +179,24 @@ class ChatBot:
         return self.sessions[user_id]
 
     @staticmethod
-    def menu_keyboard():
-        return ReplyKeyboardMarkup(
+    def menu_keyboard(include_images=True):
+        rows = (
             [
                 [MENU_CHAT, MENU_IMAGE],
                 [MENU_OCR, MENU_AUDIO],
                 [MENU_YOUTUBE, MENU_RESET],
                 [MENU_ID, MENU_HELP],
-            ],
+            ]
+            if include_images
+            else [
+                [MENU_CHAT, MENU_OCR],
+                [MENU_AUDIO, MENU_YOUTUBE],
+                [MENU_RESET, MENU_ID],
+                [MENU_HELP],
+            ]
+        )
+        return ReplyKeyboardMarkup(
+            rows,
             resize_keyboard=True,
             is_persistent=False,
             one_time_keyboard=True,
@@ -233,6 +261,18 @@ class ChatBot:
         await self.deny(update)
         return False
 
+    async def require_image_access(self, update):
+        if not await self.require_access(update):
+            return False
+        if self.image_allowed(update.effective_user.id):
+            return True
+        await self.send_menu_text(
+            update.message,
+            "🔒 إنشاء وتعديل الصور متاح لصاحب البوت فقط.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return False
+
     async def begin_expensive_request(self, update):
         if not await self.require_access(update):
             return False
@@ -252,7 +292,9 @@ class ChatBot:
             "👋 أهلًا بك في بوت الذكاء الاصطناعي\n\n"
             "اختر ميزة من القائمة أو أرسل سؤالك مباشرة.\n"
             "لإظهار القائمة لاحقًا استخدم /menu.",
-            reply_markup=self.menu_keyboard(),
+            reply_markup=self.menu_keyboard(
+                include_images=self.image_allowed(update.effective_user.id)
+            ),
         )
 
     async def menu_command(self, update, context):
@@ -261,7 +303,9 @@ class ChatBot:
         await self.send_menu_text(
             update.message,
             "اختر الميزة التي تريدها:",
-            reply_markup=self.menu_keyboard(),
+            reply_markup=self.menu_keyboard(
+                include_images=self.image_allowed(update.effective_user.id)
+            ),
         )
 
     async def help_command(self, update, context):
@@ -304,7 +348,10 @@ class ChatBot:
         )
 
     async def set_mode(self, update, mode, prompt):
-        if not await self.require_access(update):
+        if mode == "image":
+            if not await self.require_image_access(update):
+                return
+        elif not await self.require_access(update):
             return
         state = self.session(update.effective_user.id)
         state["mode"] = mode
@@ -422,6 +469,8 @@ class ChatBot:
             await self.api_error(update.message, exc)
 
     async def generate_image(self, update, prompt):
+        if not await self.require_image_access(update):
+            return
         if not await self.begin_expensive_request(update):
             return
         await self.send_menu_text(update.message, "🎨 عم جهّز الصورة، قد يستغرق ذلك قليلًا…")
@@ -480,6 +529,8 @@ class ChatBot:
         )
 
     async def edit_image(self, update, context, file_id, prompt):
+        if not await self.require_image_access(update):
+            return
         if not await self.begin_expensive_request(update):
             return
         await self.send_menu_text(update.message, "🎨 عم عدّل الصورة، قد يستغرق ذلك قليلًا…")
@@ -546,6 +597,10 @@ class ChatBot:
             return
         state = self.session(update.effective_user.id)
         if state["mode"] in ("image", "image_edit"):
+            if not await self.require_image_access(update):
+                state["mode"] = "chat"
+                state["pending_image_file_id"] = None
+                return
             file_id = update.message.photo[-1].file_id
             prompt = (update.message.caption or "").strip()
             if prompt:
